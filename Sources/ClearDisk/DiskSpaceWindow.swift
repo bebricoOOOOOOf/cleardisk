@@ -379,9 +379,9 @@ final class DiskSpaceStore: ObservableObject {
                 ? preservedDirectoryURLs(for: location)
                 : [],
             maximumMaterializedDepth: Self.maximumMaterializedDepth,
-            atomicSummaryWorkerLimit: Self.scanWorkerLimit(for: rootURL),
-            directoryClassificationWorkerLimit: Self.scanWorkerLimit(for: rootURL),
-            directoryTraversalWorkerLimit: Self.scanWorkerLimit(for: rootURL)
+            atomicSummaryWorkerLimit: Self.scanWorkerLimits(for: rootURL).atomic,
+            directoryClassificationWorkerLimit: Self.scanWorkerLimits(for: rootURL).classification,
+            directoryTraversalWorkerLimit: Self.scanWorkerLimits(for: rootURL).traversal
         )
 
         for try await event in scanner.events(for: request) {
@@ -432,9 +432,9 @@ final class DiskSpaceStore: ObservableObject {
                     includesHiddenItems: true,
                     expandsPackages: false,
                     maximumMaterializedDepth: Self.maximumMaterializedDepth,
-                    atomicSummaryWorkerLimit: Self.scanWorkerLimit(for: source.url),
-                    directoryClassificationWorkerLimit: Self.scanWorkerLimit(for: source.url),
-                    directoryTraversalWorkerLimit: Self.scanWorkerLimit(for: source.url)
+                    atomicSummaryWorkerLimit: Self.scanWorkerLimits(for: source.url).atomic,
+                    directoryClassificationWorkerLimit: Self.scanWorkerLimits(for: source.url).classification,
+                    directoryTraversalWorkerLimit: Self.scanWorkerLimits(for: source.url).traversal
                 )
 
                 for try await event in scanner.events(for: request) {
@@ -951,10 +951,36 @@ final class DiskSpaceStore: ObservableObject {
         candidate != root && candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
-    private static func scanWorkerLimit(for rootURL: URL) -> Int {
-        // A full-volume walk is long-running background work. One worker keeps the Mac usable;
-        // focused folder scans may use two workers without monopolizing the CPU.
-        normalizedPath(rootURL.path) == "/" ? 1 : 2
+    private static func scanWorkerLimits(for rootURL: URL) -> (traversal: Int, classification: Int, atomic: Int) {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let isLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let isFullVolume = normalizedPath(rootURL.path) == "/"
+
+        if isFullVolume {
+            if cores <= 2 || isLowPower {
+                // Low-spec or low power mode: keep background walk gentle to preserve system responsiveness
+                return (traversal: 1, classification: 1, atomic: 2)
+            } else if cores <= 4 {
+                // 4-core device: leave 2 cores completely free for user apps
+                return (traversal: 2, classification: 2, atomic: 3)
+            } else {
+                // Multi-core (Apple Silicon 8+ cores or Intel i7/i9):
+                // 3-4 traversal workers saturate NVMe APFS throughput without lock contention,
+                // while leaving half or more CPU cores completely idle for the user.
+                let t = min(4, max(2, cores / 2))
+                return (traversal: t, classification: t, atomic: min(6, t + 2))
+            }
+        } else {
+            // Focused folder scans (e.g. ~/Downloads, ~/Documents)
+            if cores <= 2 || isLowPower {
+                return (traversal: 1, classification: 1, atomic: 2)
+            } else if cores <= 4 {
+                return (traversal: 2, classification: 2, atomic: 4)
+            } else {
+                let t = min(6, max(2, cores / 2))
+                return (traversal: t, classification: t, atomic: min(8, t + 2))
+            }
+        }
     }
 
     private var locationRootNode: DiskFileNode? {

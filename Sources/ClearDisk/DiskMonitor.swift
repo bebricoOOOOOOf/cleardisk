@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import UserNotifications
+import Darwin
 
 // MARK: - Disk Monitor
 class DiskMonitor: ObservableObject {
@@ -499,16 +500,28 @@ class DiskMonitor: ObservableObject {
             ("Photos", "photo.fill", ["\(home)/Pictures"]),
         ]
         
+        let opQueue = OperationQueue()
+        opQueue.qualityOfService = .utility
+        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
+        let lock = NSLock()
         var cats: [DiskCategory] = []
+
         for (name, icon, paths) in categoryPaths {
-            var totalSize: Int64 = 0
-            for path in paths {
-                totalSize += directorySize(path: path)
-            }
-            if totalSize > 0 {
-                cats.append(DiskCategory(name: name, icon: icon, size: totalSize))
+            opQueue.addOperation { [weak self] in
+                guard let self else { return }
+                var totalSize: Int64 = 0
+                for path in paths {
+                    totalSize += self.directorySize(path: path)
+                }
+                if totalSize > 0 {
+                    let category = DiskCategory(name: name, icon: icon, size: totalSize)
+                    lock.lock()
+                    cats.append(category)
+                    lock.unlock()
+                }
             }
         }
+        opQueue.waitUntilAllOperationsAreFinished()
         
         cats.sort { $0.size > $1.size }
         
@@ -838,37 +851,54 @@ class DiskMonitor: ObservableObject {
     private func scanKnownCaches() {
         let definitions = allKnownCacheDefinitions()
         
+        // Fast pre-filter: skip paths that don't exist on disk before dispatching tasks
+        let existingDefinitions = definitions.filter { entry in
+            access(entry.path, F_OK) == 0
+        }
+
+        let opQueue = OperationQueue()
+        opQueue.qualityOfService = .utility
+        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
+        let lock = NSLock()
         var caches: [DevCache] = []
-        for entry in definitions {
-            let size = directorySize(path: entry.path)
-            if size > 1_048_576 { // Only show if > 1MB
-                let lastAccessed = lastModifiedDate(path: entry.path)
-                let daysSinceAccess = daysSince(lastAccessed)
-                let suggestion = generateSuggestion(name: entry.name, size: size, daysSinceAccess: daysSinceAccess)
-                // Resolve DerivedData subfolders to project names
-                var detail: String? = nil
-                if entry.rawName == "Xcode DerivedData" {
-                    detail = derivedDataProjectSummary()
+
+        for entry in existingDefinitions {
+            opQueue.addOperation { [weak self] in
+                guard let self else { return }
+                let size = self.directorySize(path: entry.path)
+                if size > 1_048_576 { // Only show if > 1MB
+                    let lastAccessed = self.lastModifiedDate(path: entry.path)
+                    let daysSinceAccess = self.daysSince(lastAccessed)
+                    let suggestion = self.generateSuggestion(name: entry.name, size: size, daysSinceAccess: daysSinceAccess)
+                    // Resolve DerivedData subfolders to project names
+                    var detail: String? = nil
+                    if entry.rawName == "Xcode DerivedData" {
+                        detail = self.derivedDataProjectSummary()
+                    }
+                    
+                    let cache = DevCache(
+                        name: entry.name,
+                        rawName: entry.rawName,
+                        icon: entry.icon,
+                        path: entry.path,
+                        size: size,
+                        lastAccessed: lastAccessed,
+                        daysSinceAccess: daysSinceAccess,
+                        suggestion: suggestion,
+                        riskLevel: entry.riskLevel,
+                        cacheDescription: entry.description,
+                        group: entry.group,
+                        section: entry.section,
+                        safetyDetails: entry.safetyDetails,
+                        detail: detail
+                    )
+                    lock.lock()
+                    caches.append(cache)
+                    lock.unlock()
                 }
-                
-                caches.append(DevCache(
-                    name: entry.name,
-                    rawName: entry.rawName,
-                    icon: entry.icon,
-                    path: entry.path,
-                    size: size,
-                    lastAccessed: lastAccessed,
-                    daysSinceAccess: daysSinceAccess,
-                    suggestion: suggestion,
-                    riskLevel: entry.riskLevel,
-                    cacheDescription: entry.description,
-                    group: entry.group,
-                    section: entry.section,
-                    safetyDetails: entry.safetyDetails,
-                    detail: detail
-                ))
             }
         }
+        opQueue.waitUntilAllOperationsAreFinished()
         
         caches.sort { $0.size > $1.size }
         
@@ -951,8 +981,6 @@ class DiskMonitor: ObservableObject {
     private func scanLargeFiles() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let threshold: Int64 = 100_000_000 // 100MB
-        var files: [LargeFile] = []
-        
         let scanDirs = [
             "\(home)/Downloads",
             "\(home)/Documents",
@@ -962,10 +990,26 @@ class DiskMonitor: ObservableObject {
             "\(home)/Pictures",
         ]
         
+        let opQueue = OperationQueue()
+        opQueue.qualityOfService = .utility
+        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
+        let lock = NSLock()
+        var files: [LargeFile] = []
+
         for dir in scanDirs {
-            let folderName = (dir as NSString).lastPathComponent
-            findLargeFiles(in: dir, folder: folderName, threshold: threshold, results: &files, maxDepth: 3, currentDepth: 0)
+            opQueue.addOperation { [weak self] in
+                guard let self else { return }
+                let folderName = (dir as NSString).lastPathComponent
+                var dirFiles: [LargeFile] = []
+                self.findLargeFiles(in: dir, folder: folderName, threshold: threshold, results: &dirFiles, maxDepth: 3, currentDepth: 0)
+                if !dirFiles.isEmpty {
+                    lock.lock()
+                    files.append(contentsOf: dirFiles)
+                    lock.unlock()
+                }
+            }
         }
+        opQueue.waitUntilAllOperationsAreFinished()
         
         files.sort { $0.size > $1.size }
         
@@ -1461,30 +1505,43 @@ class DiskMonitor: ObservableObject {
     }
     
     // MARK: - Helpers
-    func directorySize(path: String) -> Int64 {
-        let fm = FileManager.default
-        var totalSize: Int64 = 0
-        
-        guard let enumerator = fm.enumerator(
-            at: URL(fileURLWithPath: path),
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey, .linkCountKey],
-            options: [],  // Don't skip hidden files — caches often contain them
-            errorHandler: nil
-        ) else { return 0 }
-        
-        for case let fileURL as URL in enumerator {
-            guard let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey, .linkCountKey]),
-                  values.isRegularFile == true else { continue }
-            // Use totalFileAllocatedSize (accounts for sparse files like Docker.raw)
-            // Falls back to fileAllocatedSize if total isn't available
-            let size = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0
-            // Hardlink-aware: a file with N hard links only frees `size / N` bytes when one link is removed.
-            // This is critical for pnpm / Bun / Yarn Berry / Cargo registry stores that hardlink into project caches —
-            // otherwise we wildly overestimate how much disk space cleaning would actually free.
-            let links = max(values.linkCount ?? 1, 1)
-            totalSize += Int64(size / links)
+    /// Calculates optimal concurrency based on available CPU cores.
+    /// Keeps CPU and thermal load low on budget/older Macs, while maximizing NVMe APFS throughput.
+    static var optimalScanConcurrency: Int {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        if cores <= 2 {
+            return max(1, cores)
+        } else if cores <= 4 {
+            return 2
+        } else {
+            return min(4, max(2, cores / 2))
         }
-        
+    }
+
+    func directorySize(path: String) -> Int64 {
+        guard let cPath = strdup(path) else { return 0 }
+        defer { free(cPath) }
+        guard access(cPath, F_OK) == 0 else { return 0 }
+
+        let pathList: [UnsafeMutablePointer<CChar>?] = [cPath, nil]
+        guard let tree = pathList.withUnsafeBufferPointer({ ptr in
+            fts_open(UnsafeMutablePointer(mutating: ptr.baseAddress!), FTS_PHYSICAL | FTS_NOCHDIR, nil)
+        }) else { return 0 }
+        defer { fts_close(tree) }
+
+        var totalSize: Int64 = 0
+        while let node = fts_read(tree) {
+            if node.pointee.fts_info == FTS_F {
+                let statp = node.pointee.fts_statp.pointee
+                // st_blocks is 512-byte blocks allocated on disk (matches totalFileAllocatedSize / fileAllocatedSize)
+                let size = max(0, Int64(statp.st_blocks)) * 512
+                // Hardlink-aware: a file with N hard links only frees `size / N` bytes when one link is removed.
+                // This is critical for pnpm / Bun / Yarn Berry / Cargo registry stores that hardlink into project caches —
+                // otherwise we wildly overestimate how much disk space cleaning would actually free.
+                let links = max(Int64(statp.st_nlink), 1)
+                totalSize += size / links
+            }
+        }
         return totalSize
     }
 }
