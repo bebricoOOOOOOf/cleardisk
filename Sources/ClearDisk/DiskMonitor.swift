@@ -1,7 +1,6 @@
 import Foundation
 import AppKit
 import UserNotifications
-import Darwin
 
 // MARK: - Disk Monitor
 class DiskMonitor: ObservableObject {
@@ -189,11 +188,6 @@ class DiskMonitor: ObservableObject {
         }
     }
     
-    /// Check if a path is readable before scanning
-    private func canAccess(path: String) -> Bool {
-        FileManager.default.isReadableFile(atPath: path)
-    }
-    
     private var isScanInProgress = false
     private var isCacheScanInProgress = false
 
@@ -212,12 +206,10 @@ class DiskMonitor: ObservableObject {
         guard !isScanInProgress, !isCacheScanInProgress else { return } // Prevent concurrent scans
         isScanInProgress = true
         isScanning = true
+        inaccessiblePaths = []
         scanProgress = 0.03
         scanStatusText = L("Preparing storage analysis...")
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            // Reset scan status
-            var inaccessible: [String] = []
-            
             self?.publishScanProgress(0.08, L("Reading disk capacity..."))
             self?.scanDiskCapacity()
             self?.publishScanProgress(0.18, L("Analyzing storage categories..."))
@@ -231,22 +223,11 @@ class DiskMonitor: ObservableObject {
             self?.publishScanProgress(0.92, L("Measuring Trash and finalizing results..."))
             let trashBytes = self?.trashSize() ?? 0
             
-            // Check which known cache paths are inaccessible.
-            let cachePaths = self?.knownCachePaths() ?? []
-            for (name, path) in cachePaths {
-                let expanded = (path as NSString).expandingTildeInPath
-                let parent = (expanded as NSString).deletingLastPathComponent
-                if FileManager.default.fileExists(atPath: parent) && !(self?.canAccess(path: expanded) ?? true) {
-                    inaccessible.append(name)
-                }
-            }
-            
             DispatchQueue.main.async {
                 self?.isScanning = false
                 self?.isScanInProgress = false
                 self?.scanProgress = 1
-                self?.scanStatusText = L("Analysis complete")
-                self?.inaccessiblePaths = inaccessible
+                self?.scanStatusText = self?.inaccessiblePaths.isEmpty == true ? L("Analysis complete") : L("Analysis incomplete: some locations could not be measured.")
                 self?.hasCompletedFirstScan = true
                 self?.hasCompletedCacheScan = true
                 self?.lastFullScanAt = Date()
@@ -270,6 +251,7 @@ class DiskMonitor: ObservableObject {
         guard !isScanInProgress, !isCacheScanInProgress else { return }
         isCacheScanInProgress = true
         isScanningCaches = true
+        inaccessiblePaths = []
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.scanKnownCaches()
@@ -500,11 +482,8 @@ class DiskMonitor: ObservableObject {
             ("Photos", "photo.fill", ["\(home)/Pictures"]),
         ]
         
-        let opQueue = OperationQueue()
-        opQueue.qualityOfService = .utility
-        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
-        let lock = NSLock()
-        var cats: [DiskCategory] = []
+        let opQueue = ScanOperationScheduler.shared.queue
+        let collected = ScanResults<DiskCategory>()
 
         for (name, icon, paths) in categoryPaths {
             opQueue.addOperation { [weak self] in
@@ -515,13 +494,12 @@ class DiskMonitor: ObservableObject {
                 }
                 if totalSize > 0 {
                     let category = DiskCategory(name: name, icon: icon, size: totalSize)
-                    lock.lock()
-                    cats.append(category)
-                    lock.unlock()
+                    collected.append(category)
                 }
             }
         }
         opQueue.waitUntilAllOperationsAreFinished()
+        var cats = collected.snapshot()
         
         cats.sort { $0.size > $1.size }
         
@@ -851,18 +829,10 @@ class DiskMonitor: ObservableObject {
     private func scanKnownCaches() {
         let definitions = allKnownCacheDefinitions()
         
-        // Fast pre-filter: skip paths that don't exist on disk before dispatching tasks
-        let existingDefinitions = definitions.filter { entry in
-            access(entry.path, F_OK) == 0
-        }
+        let opQueue = ScanOperationScheduler.shared.queue
+        let collected = ScanResults<DevCache>()
 
-        let opQueue = OperationQueue()
-        opQueue.qualityOfService = .utility
-        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
-        let lock = NSLock()
-        var caches: [DevCache] = []
-
-        for entry in existingDefinitions {
+        for entry in definitions {
             opQueue.addOperation { [weak self] in
                 guard let self else { return }
                 let size = self.directorySize(path: entry.path)
@@ -892,13 +862,12 @@ class DiskMonitor: ObservableObject {
                         safetyDetails: entry.safetyDetails,
                         detail: detail
                     )
-                    lock.lock()
-                    caches.append(cache)
-                    lock.unlock()
+                    collected.append(cache)
                 }
             }
         }
         opQueue.waitUntilAllOperationsAreFinished()
+        var caches = collected.snapshot()
         
         caches.sort { $0.size > $1.size }
         
@@ -990,11 +959,8 @@ class DiskMonitor: ObservableObject {
             "\(home)/Pictures",
         ]
         
-        let opQueue = OperationQueue()
-        opQueue.qualityOfService = .utility
-        opQueue.maxConcurrentOperationCount = DiskMonitor.optimalScanConcurrency
-        let lock = NSLock()
-        var files: [LargeFile] = []
+        let opQueue = ScanOperationScheduler.shared.queue
+        let collected = ScanResults<LargeFile>()
 
         for dir in scanDirs {
             opQueue.addOperation { [weak self] in
@@ -1003,13 +969,12 @@ class DiskMonitor: ObservableObject {
                 var dirFiles: [LargeFile] = []
                 self.findLargeFiles(in: dir, folder: folderName, threshold: threshold, results: &dirFiles, maxDepth: 3, currentDepth: 0)
                 if !dirFiles.isEmpty {
-                    lock.lock()
-                    files.append(contentsOf: dirFiles)
-                    lock.unlock()
+                    collected.append(contentsOf: dirFiles)
                 }
             }
         }
         opQueue.waitUntilAllOperationsAreFinished()
+        var files = collected.snapshot()
         
         files.sort { $0.size > $1.size }
         
@@ -1122,8 +1087,11 @@ class DiskMonitor: ObservableObject {
             let fullPath = (path as NSString).appendingPathComponent(item)
             if let reason = moveToTrash(path: fullPath), failure == nil { failure = reason }
         }
-        let remaining = directorySize(path: path)
-        return (max(0, sizeBefore - remaining), failure)
+        let remaining = DirectoryMeasurement.measure(path: path)
+        guard remaining.isComplete else {
+            return (0, failure ?? remaining.firstError)
+        }
+        return (max(0, sizeBefore - remaining.bytes), failure)
     }
 
     func cleanDevCache(_ cache: DevCache) {
@@ -1166,21 +1134,29 @@ class DiskMonitor: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let fm = FileManager.default
-            let sizeBefore = self.directorySize(path: trashPath)
-            if let contents = try? fm.contentsOfDirectory(atPath: trashPath) {
-                for item in contents {
-                    let fullPath = (trashPath as NSString).appendingPathComponent(item)
-                    try? fm.removeItem(atPath: fullPath) // Trash empty = permanent delete (intended)
+            let before = DirectoryMeasurement.measure(path: trashPath)
+            var failure: String? = before.firstError
+            do {
+                for item in try fm.contentsOfDirectory(atPath: trashPath) {
+                    do {
+                        try fm.removeItem(atPath: (trashPath as NSString).appendingPathComponent(item))
+                    } catch {
+                        if failure == nil { failure = error.localizedDescription }
+                    }
                 }
+            } catch {
+                if failure == nil { failure = error.localizedDescription }
             }
-            let remaining = self.directorySize(path: trashPath)
+            let remaining = DirectoryMeasurement.measure(path: trashPath)
+            if failure == nil { failure = remaining.firstError }
+            if failure == nil && remaining.bytes > 0 {
+                failure = L("Some items in the Trash could not be removed.")
+            }
+            let freed = before.isComplete && remaining.isComplete
+                ? max(0, before.bytes - remaining.bytes) : 0
+            let finalFailure = failure
             DispatchQueue.main.async {
-                self.finishClean(
-                    title: "Trash",
-                    freed: max(0, sizeBefore - remaining),
-                    failure: remaining > 0 ? L("Some items in the Trash could not be removed.") : nil,
-                    outcome: .reclaimedSpace
-                )
+                self.finishClean(title: "Trash", freed: freed, failure: finalFailure, outcome: .reclaimedSpace)
             }
         }
     }
@@ -1305,12 +1281,20 @@ class DiskMonitor: ObservableObject {
     ]
 
     private func scanProjectArtifacts() {
-        var artifacts: [ProjectArtifact] = []
+        let opQueue = ScanOperationScheduler.shared.queue
+        let collected = ScanResults<ProjectArtifact>()
         let fm = FileManager.default
 
         for root in projectScanRoots() {
             guard fm.fileExists(atPath: root) else { continue }
-            findProjectArtifacts(in: root, results: &artifacts, maxDepth: 5, currentDepth: 0)
+            opQueue.addOperation { [weak self] in
+                guard let self else { return }
+                var localResults: [ProjectArtifact] = []
+                self.findProjectArtifacts(in: root, results: &localResults, maxDepth: 5, currentDepth: 0)
+                if !localResults.isEmpty {
+                    collected.append(contentsOf: localResults)
+                }
+            }
         }
 
         // Repositories kept directly in `~` were invisible: every root above is a subdirectory of the
@@ -1330,9 +1314,18 @@ class DiskMonitor: ObservableObject {
                 let full = (home as NSString).appendingPathComponent(entry)
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
-                findProjectArtifacts(in: full, results: &artifacts, maxDepth: 1, currentDepth: 0)
+                opQueue.addOperation { [weak self] in
+                    guard let self else { return }
+                    var localResults: [ProjectArtifact] = []
+                    self.findProjectArtifacts(in: full, results: &localResults, maxDepth: 1, currentDepth: 0)
+                    if !localResults.isEmpty {
+                        collected.append(contentsOf: localResults)
+                    }
+                }
             }
         }
+        opQueue.waitUntilAllOperationsAreFinished()
+        var artifacts = collected.snapshot()
 
         // Defensive: the scan roots are disjoint today, but a duplicate row double-counts its size in
         // the totals and makes the second clean fail on an already-trashed path. Keep the first sighting.
@@ -1505,45 +1498,20 @@ class DiskMonitor: ObservableObject {
     }
     
     // MARK: - Helpers
-    /// Calculates optimal concurrency based on available CPU cores.
-    /// Keeps CPU and thermal load low on budget/older Macs, while maximizing NVMe APFS throughput.
-    static var optimalScanConcurrency: Int {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        if cores <= 2 {
-            return max(1, cores)
-        } else if cores <= 4 {
-            return 2
-        } else {
-            return min(4, max(2, cores / 2))
-        }
-    }
-
     func directorySize(path: String) -> Int64 {
-        guard let cPath = strdup(path) else { return 0 }
-        defer { free(cPath) }
-        guard access(cPath, F_OK) == 0 else { return 0 }
-
-        let pathList: [UnsafeMutablePointer<CChar>?] = [cPath, nil]
-        guard let tree = pathList.withUnsafeBufferPointer({ ptr in
-            fts_open(UnsafeMutablePointer(mutating: ptr.baseAddress!), FTS_PHYSICAL | FTS_NOCHDIR, nil)
-        }) else { return 0 }
-        defer { fts_close(tree) }
-
-        var totalSize: Int64 = 0
-        while let node = fts_read(tree) {
-            if node.pointee.fts_info == FTS_F {
-                let statp = node.pointee.fts_statp.pointee
-                // st_blocks is 512-byte blocks allocated on disk (matches totalFileAllocatedSize / fileAllocatedSize)
-                let size = max(0, Int64(statp.st_blocks)) * 512
-                // Hardlink-aware: a file with N hard links only frees `size / N` bytes when one link is removed.
-                // This is critical for pnpm / Bun / Yarn Berry / Cargo registry stores that hardlink into project caches —
-                // otherwise we wildly overestimate how much disk space cleaning would actually free.
-                let links = max(Int64(statp.st_nlink), 1)
-                totalSize += size / links
+        let measurement = DirectoryMeasurement.measure(path: path)
+        if let error = measurement.firstError {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.inaccessiblePaths.count < 100, !self.inaccessiblePaths.contains(error) {
+                    self.inaccessiblePaths.append(error)
+                }
             }
         }
-        return totalSize
+        // Partial sizes must not become cache candidates or cleanup promises.
+        return measurement.isComplete ? measurement.bytes : 0
     }
+
 }
 
 // MARK: - Permission State
@@ -1559,14 +1527,14 @@ enum CleanOutcome {
 }
 
 // MARK: - Models
-struct DiskCategory: Identifiable {
+struct DiskCategory: Identifiable, Sendable {
     let id = UUID()
     let name: String
     let icon: String
     let size: Int64
 }
 
-struct DevCache: Identifiable {
+struct DevCache: Identifiable, Sendable {
     let id: UUID
     /// Display name, localized for the user's language.
     let name: String
@@ -1641,7 +1609,7 @@ struct DevCache: Identifiable {
     }
 }
 
-struct LargeFile: Identifiable {
+struct LargeFile: Identifiable, Sendable {
     let id = UUID()
     let name: String
     let path: String
@@ -1658,7 +1626,7 @@ struct CleanFailure: Identifiable {
     let isPermission: Bool // true → the fix is granting Full Disk Access
 }
 
-struct ProjectArtifact: Identifiable {
+struct ProjectArtifact: Identifiable, Sendable {
     let id = UUID()
     let projectName: String // e.g. "my-react-app"
     let projectPath: String // full path to project root

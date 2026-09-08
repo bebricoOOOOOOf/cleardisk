@@ -115,6 +115,8 @@ final class DiskSpaceStore: ObservableObject {
 
     private let scanner = DiskScanner()
     private var scanTask: Task<Void, Never>?
+    private var resourceObservers: [NSObjectProtocol] = []
+    private var scanResourcePolicy = ScanResourcePolicy.current
     private var activeScanID: UUID?
     private var scannedRootPath: String?
     private var activeScanRootURL: URL?
@@ -127,9 +129,24 @@ final class DiskSpaceStore: ObservableObject {
 
     init() {
         reloadLocations()
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            resourceObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.handleResourceChange() }
+            })
+        }
+    }
+
+    private func handleResourceChange() {
+        let policy = ScanResourcePolicy.current
+        guard phase == .scanning, policy.workers < scanResourcePolicy.workers else { return }
+        // Backend budgets are fixed for one request. Cancel rather than continue at the old
+        // higher budget; a user-initiated retry takes a fresh, conservative policy snapshot.
+        stopScan()
+        phase = .failed(L("Scan stopped to reduce power or thermal load. Start again to scan with fewer workers."))
     }
 
     deinit {
+        resourceObservers.forEach { NotificationCenter.default.removeObserver($0) }
         scanTask?.cancel()
     }
 
@@ -325,6 +342,7 @@ final class DiskSpaceStore: ObservableObject {
         let scanID = UUID()
         activeScanID = scanID
         phase = .scanning
+        scanResourcePolicy = .current
         progress = nil
         issues = []
         // A rescan must not retain the previous full-volume tree while a second
@@ -371,6 +389,7 @@ final class DiskSpaceStore: ObservableObject {
         scanID: UUID
     ) async throws {
         var collectedIssues: [DiskScanIssue] = []
+        let limits = scanResourcePolicy.backendLimits
         let request = DiskScanRequest(
             rootURL: rootURL,
             includesHiddenItems: true,
@@ -379,9 +398,9 @@ final class DiskSpaceStore: ObservableObject {
                 ? preservedDirectoryURLs(for: location)
                 : [],
             maximumMaterializedDepth: Self.maximumMaterializedDepth,
-            atomicSummaryWorkerLimit: Self.scanWorkerLimits(for: rootURL).atomic,
-            directoryClassificationWorkerLimit: Self.scanWorkerLimits(for: rootURL).classification,
-            directoryTraversalWorkerLimit: Self.scanWorkerLimits(for: rootURL).traversal
+            atomicSummaryWorkerLimit: limits.atomic,
+            directoryClassificationWorkerLimit: limits.classification,
+            directoryTraversalWorkerLimit: limits.traversal
         )
 
         for try await event in scanner.events(for: request) {
@@ -427,14 +446,15 @@ final class DiskSpaceStore: ObservableObject {
 
             for source in group.sources {
                 var sourceSnapshot: DiskScanSnapshot?
+                let limits = scanResourcePolicy.backendLimits
                 let request = DiskScanRequest(
                     rootURL: source.url,
                     includesHiddenItems: true,
                     expandsPackages: false,
                     maximumMaterializedDepth: Self.maximumMaterializedDepth,
-                    atomicSummaryWorkerLimit: Self.scanWorkerLimits(for: source.url).atomic,
-                    directoryClassificationWorkerLimit: Self.scanWorkerLimits(for: source.url).classification,
-                    directoryTraversalWorkerLimit: Self.scanWorkerLimits(for: source.url).traversal
+                    atomicSummaryWorkerLimit: limits.atomic,
+                    directoryClassificationWorkerLimit: limits.classification,
+                    directoryTraversalWorkerLimit: limits.traversal
                 )
 
                 for try await event in scanner.events(for: request) {
@@ -949,38 +969,6 @@ final class DiskSpaceStore: ObservableObject {
 
     private static func path(_ candidate: String, isInside root: String) -> Bool {
         candidate != root && candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
-    }
-
-    private static func scanWorkerLimits(for rootURL: URL) -> (traversal: Int, classification: Int, atomic: Int) {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        let isLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
-        let isFullVolume = normalizedPath(rootURL.path) == "/"
-
-        if isFullVolume {
-            if cores <= 2 || isLowPower {
-                // Low-spec or low power mode: keep background walk gentle to preserve system responsiveness
-                return (traversal: 1, classification: 1, atomic: 2)
-            } else if cores <= 4 {
-                // 4-core device: leave 2 cores completely free for user apps
-                return (traversal: 2, classification: 2, atomic: 3)
-            } else {
-                // Multi-core (Apple Silicon 8+ cores or Intel i7/i9):
-                // 3-4 traversal workers saturate NVMe APFS throughput without lock contention,
-                // while leaving half or more CPU cores completely idle for the user.
-                let t = min(4, max(2, cores / 2))
-                return (traversal: t, classification: t, atomic: min(6, t + 2))
-            }
-        } else {
-            // Focused folder scans (e.g. ~/Downloads, ~/Documents)
-            if cores <= 2 || isLowPower {
-                return (traversal: 1, classification: 1, atomic: 2)
-            } else if cores <= 4 {
-                return (traversal: 2, classification: 2, atomic: 4)
-            } else {
-                let t = min(6, max(2, cores / 2))
-                return (traversal: t, classification: t, atomic: min(8, t + 2))
-            }
-        }
     }
 
     private var locationRootNode: DiskFileNode? {
